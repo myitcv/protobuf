@@ -1776,7 +1776,7 @@ func (g *Generator) generateMessage(message *Descriptor) {
 		// TODO: This allocation occurs based on the order of the fields
 		// in the proto file, meaning that a change in the field
 		// ordering can change generated Method/Field names.
-		base := CamelCase(*field.Name)
+		base := "_" + CamelCase(*field.Name)
 		ns := allocNames(base, "Get"+base)
 		fieldName, fieldGetterName := ns[0], ns[1]
 		typename, wiretype := g.GoType(message, field)
@@ -1789,7 +1789,7 @@ func (g *Generator) generateMessage(message *Descriptor) {
 		oneof := field.OneofIndex != nil
 		if oneof && oneofFieldName[*field.OneofIndex] == "" {
 			odp := message.OneofDecl[int(*field.OneofIndex)]
-			fname := allocNames(CamelCase(odp.GetName()))[0]
+			fname := "_" + allocNames(CamelCase(odp.GetName()))[0]
 
 			// This is the first field of a oneof we haven't seen before.
 			// Generate the union field.
@@ -2042,6 +2042,9 @@ func (g *Generator) generateMessage(message *Descriptor) {
 	}
 	g.P()
 	for _, field := range message.Field {
+		g.P("// field ", fieldNames[field])
+	}
+	for _, field := range message.Field {
 		if field.OneofIndex == nil {
 			continue
 		}
@@ -2050,7 +2053,7 @@ func (g *Generator) generateMessage(message *Descriptor) {
 	g.P()
 	for oi := range message.OneofDecl {
 		fname := oneofFieldName[int32(oi)]
-		g.P("func (m *", ccTypeName, ") Get", fname, "() ", oneofDisc[int32(oi)], " {")
+		g.P("func (m *", ccTypeName, ") _Get", fname, "() ", oneofDisc[int32(oi)], " {")
 		g.P("if m != nil { return m.", fname, " }")
 		g.P("return nil")
 		g.P("}")
@@ -2067,7 +2070,7 @@ func (g *Generator) generateMessage(message *Descriptor) {
 		if t, ok := mapFieldTypes[field]; ok {
 			typename = t
 		}
-		mname := fieldGetterNames[field]
+		mname := fieldNames[field][1:]
 		star := ""
 		if needsStar(*field.Type) && typename[0] == '*' {
 			typename = typename[1:]
@@ -2075,9 +2078,9 @@ func (g *Generator) generateMessage(message *Descriptor) {
 		}
 
 		// In proto3, only generate getters for message fields and oneof fields.
-		if message.proto3() && *field.Type != descriptor.FieldDescriptorProto_TYPE_MESSAGE && !oneof {
-			continue
-		}
+		// if message.proto3() && *field.Type != descriptor.FieldDescriptorProto_TYPE_MESSAGE && !oneof {
+		// 	continue
+		// }
 
 		// Only export getter symbols for basic types,
 		// and for messages and enums in the same package.
@@ -2137,7 +2140,11 @@ func (g *Generator) generateMessage(message *Descriptor) {
 			continue
 		}
 		if !oneof {
-			g.P("if m != nil && m." + fname + " != nil {")
+			if !typeDefaultIsNil {
+				g.P("if m != nil {")
+			} else {
+				g.P("if m != nil && m." + fname + " != nil {")
+			}
 			g.In()
 			g.P("return " + star + "m." + fname)
 			g.Out()
@@ -2145,7 +2152,151 @@ func (g *Generator) generateMessage(message *Descriptor) {
 		} else {
 			uname := oneofFieldName[*field.OneofIndex]
 			tname := oneofTypeName[field]
-			g.P("if x, ok := m.Get", uname, "().(*", tname, "); ok {")
+			g.P("if x, ok := m._Get", uname, "().(*", tname, "); ok {")
+			g.P("return x.", fname)
+			g.P("}")
+		}
+		if hasDef {
+			if *field.Type != descriptor.FieldDescriptorProto_TYPE_BYTES {
+				g.P("return " + def)
+			} else {
+				// The default is a []byte var.
+				// Make a copy when returning it to be safe.
+				g.P("return append([]byte(nil), ", def, "...)")
+			}
+		} else {
+			switch *field.Type {
+			case descriptor.FieldDescriptorProto_TYPE_BOOL:
+				g.P("return false")
+			case descriptor.FieldDescriptorProto_TYPE_STRING:
+				g.P(`return ""`)
+			case descriptor.FieldDescriptorProto_TYPE_GROUP,
+				descriptor.FieldDescriptorProto_TYPE_MESSAGE,
+				descriptor.FieldDescriptorProto_TYPE_BYTES:
+				// This is only possible for oneof fields.
+				g.P("return nil")
+			case descriptor.FieldDescriptorProto_TYPE_ENUM:
+				// The default default for an enum is the first value in the enum,
+				// not zero.
+				obj := g.ObjectNamed(field.GetTypeName())
+				var enum *EnumDescriptor
+				if id, ok := obj.(*ImportedDescriptor); ok {
+					// The enum type has been publicly imported.
+					enum, _ = id.o.(*EnumDescriptor)
+				} else {
+					enum, _ = obj.(*EnumDescriptor)
+				}
+				if enum == nil {
+					log.Printf("don't know how to generate getter for %s", field.GetName())
+					continue
+				}
+				if len(enum.Value) == 0 {
+					g.P("return 0 // empty enum")
+				} else {
+					first := enum.Value[0].GetName()
+					g.P("return ", g.DefaultPackageName(obj)+enum.prefix()+first)
+				}
+			default:
+				g.P("return 0")
+			}
+		}
+		g.Out()
+		g.P("}")
+		g.P()
+	}
+
+	// setters
+	for _, field := range message.Field {
+		oneof := field.OneofIndex != nil
+
+		fname := fieldNames[field]
+		typename, _ := g.GoType(message, field)
+		if t, ok := mapFieldTypes[field]; ok {
+			typename = t
+		}
+		mname := fieldNames[field][1:]
+		star := ""
+		if needsStar(*field.Type) && typename[0] == '*' {
+			typename = typename[1:]
+			star = "*"
+		}
+
+		// In proto3, only generate getters for message fields and oneof fields.
+		// if message.proto3() && *field.Type != descriptor.FieldDescriptorProto_TYPE_MESSAGE && !oneof {
+		// 	continue
+		// }
+
+		// Only export getter symbols for basic types,
+		// and for messages and enums in the same package.
+		// Groups are not exported.
+		// Foreign types can't be hoisted through a public import because
+		// the importer may not already be importing the defining .proto.
+		// As an example, imagine we have an import tree like this:
+		//   A.proto -> B.proto -> C.proto
+		// If A publicly imports B, we need to generate the getters from B in A's output,
+		// but if one such getter returns something from C then we cannot do that
+		// because A is not importing C already.
+		// switch *field.Type {
+		// case descriptor.FieldDescriptorProto_TYPE_GROUP:
+		// 	getter = false
+		// case descriptor.FieldDescriptorProto_TYPE_MESSAGE, descriptor.FieldDescriptorProto_TYPE_ENUM:
+		// 	// Only export getter if its return type is in this package.
+		// 	getter = g.ObjectNamed(field.GetTypeName()).PackageName() == message.PackageName()
+		// 	genType = true
+		// default:
+		// 	getter = true
+		// }
+		// if getter {
+		// getters = append(getters, getterSymbol{
+		// 	name:     mname,
+		// 	typ:      typename,
+		// 	typeName: field.GetTypeName(),
+		// 	genType:  genType,
+		// })
+		// }
+
+		g.P("// setter")
+		g.P("func (m *", ccTypeName, ") Set"+mname+"() "+typename+" {")
+		g.In()
+		def, hasDef := defNames[field]
+		typeDefaultIsNil := false // whether this field type's default value is a literal nil unless specified
+		switch *field.Type {
+		case descriptor.FieldDescriptorProto_TYPE_BYTES:
+			typeDefaultIsNil = !hasDef
+		case descriptor.FieldDescriptorProto_TYPE_GROUP, descriptor.FieldDescriptorProto_TYPE_MESSAGE:
+			typeDefaultIsNil = true
+		}
+		if isRepeated(field) {
+			typeDefaultIsNil = true
+		}
+		if typeDefaultIsNil && !oneof {
+			// A bytes field with no explicit default needs less generated code,
+			// as does a message or group field, or a repeated field.
+			g.P("if m != nil {")
+			g.In()
+			g.P("return m." + fname)
+			g.Out()
+			g.P("}")
+			g.P("return nil")
+			g.Out()
+			g.P("}")
+			g.P()
+			continue
+		}
+		if !oneof {
+			if !typeDefaultIsNil {
+				g.P("if m != nil {")
+			} else {
+				g.P("if m != nil && m." + fname + " != nil {")
+			}
+			g.In()
+			g.P("return " + star + "m." + fname)
+			g.Out()
+			g.P("}")
+		} else {
+			uname := oneofFieldName[*field.OneofIndex]
+			tname := oneofTypeName[field]
+			g.P("if x, ok := m._Get", uname, "().(*", tname, "); ok {")
 			g.P("return x.", fname)
 			g.P("}")
 		}
@@ -2661,6 +2812,13 @@ func isASCIILower(c byte) bool {
 // Is c an ASCII digit?
 func isASCIIDigit(c byte) bool {
 	return '0' <= c && c <= '9'
+}
+
+// Unicode aware lower of initial rune
+func LowerInitial(s string) string {
+	res := []rune(s)
+	res[0] = unicode.ToLower(res[0])
+	return string(res)
 }
 
 // CamelCase returns the CamelCased name.
